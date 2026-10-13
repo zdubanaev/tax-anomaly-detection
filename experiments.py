@@ -5,7 +5,7 @@
 реальным данным ГНС КР). Код воспроизводим: запуск с теми же seed даёт те же числа.
 
 Запуск:  python experiments.py
-Зависимости: numpy, pandas, scikit-learn, scipy
+Зависимости: numpy, pandas, scikit-learn, scipy, matplotlib
 """
 import warnings
 import numpy as np
@@ -215,12 +215,29 @@ def score_zscore(tr_df, te_df):
     return out
 
 
+# Методы сгруппированы по принципу, на котором основана оценка аномальности
 METHODS = {
     "Isolation Forest": score_iforest,
     "Автокодер": score_autoencoder,
     "LOF": score_lof,
     "One-Class SVM": score_ocsvm,
 }
+METHOD_GROUP = {
+    "Z-скоринг (бенчмарк)": "статистический",
+    "Isolation Forest":     "изоляция (деревья)",
+    "LOF":                  "плотность / близость",
+    "One-Class SVM":        "граница области",
+    "Автокодер":            "глубокое обучение",
+    "Ансамбль (среднее)":   "ансамбль",
+}
+# Цвет закреплён за методом и одинаков на всех рисунках
+METHOD_COLOR = {
+    "LOF": "#2a78d6", "Автокодер": "#eb6834", "Ансамбль (среднее)": "#1baf7a",
+    "One-Class SVM": "#eda100", "Z-скоринг (бенчмарк)": "#e87ba4",
+    "Isolation Forest": "#008300",
+}
+TYPE_COLOR = {"точечная": "#2a78d6", "вычеты_НДС": "#eb6834", "занижение_ФОТ": "#1baf7a"}
+NORMAL_COLOR = "#b8b7b0"
 
 
 def minmax(train_scores, test_scores):
@@ -231,6 +248,37 @@ def minmax(train_scores, test_scores):
 # ---------------------------------------------------------------------------
 # 4. Эксперимент
 # ---------------------------------------------------------------------------
+def prepare(profile, n, seed, anomaly_share=0.021, numeric_only=False):
+    """Генерация -> внедрение аномалий -> разбиение 70/30 -> предобработка.
+
+    Модели обучаются на обучающей части БЕЗ меток (аномалии в ней есть, как в жизни).
+    Метки label известны только потому, что аномалии внедрили мы сами; они нужны
+    исключительно для оценки качества на тестовой части."""
+    rng = np.random.default_rng(seed)
+    df = inject_anomalies(generate(n, profile, rng), anomaly_share, rng)
+    tr, te = train_test_split(df, test_size=0.3, stratify=df.label, random_state=seed)
+    tr_l, te_l = transform_money(tr), transform_money(te)
+    if numeric_only:
+        pre = StandardScaler().fit(tr_l[NUM_FEATURES])
+        Xtr, Xte = pre.transform(tr_l[NUM_FEATURES]), pre.transform(te_l[NUM_FEATURES])
+    else:
+        pre = make_preprocessor().fit(tr_l)
+        Xtr, Xte = pre.transform(tr_l), pre.transform(te_l)
+    return df, tr, te, tr_l, te_l, Xtr, Xte
+
+
+def all_scores(tr_l, te_l, Xtr, Xte, seed):
+    """Оценки аномальности всех шести подходов на тестовой части."""
+    scores, normed = {}, []
+    for name, fn in METHODS.items():
+        s_tr, s_te = fn(Xtr, Xte, seed)
+        scores[name] = s_te
+        normed.append(minmax(s_tr, s_te))
+    scores["Ансамбль (среднее)"] = np.mean(normed, axis=0)
+    scores["Z-скоринг (бенчмарк)"] = score_zscore(tr_l, te_l)[1]
+    return scores
+
+
 def evaluate(y, s, top_share):
     """Флаг = верхние top_share деклараций по оценке аномальности."""
     thr = np.quantile(s, 1 - top_share)
@@ -240,33 +288,13 @@ def evaluate(y, s, top_share):
                 ROC_AUC=roc_auc_score(y, s), PR_AUC=average_precision_score(y, s))
 
 
-def run_experiment(profile, n, seed, anomaly_share=0.021, top_share=0.03):
-    rng = np.random.default_rng(seed)
-    df = inject_anomalies(generate(n, profile, rng), anomaly_share, rng)
-    tr, te = train_test_split(df, test_size=0.3, stratify=df.label, random_state=seed)
-
-    # Модели обучаются на обучающей части БЕЗ меток (аномалии в ней присутствуют,
-    # как и в реальной жизни). Метки используются только для оценки на тестовой части.
-    tr_l, te_l = transform_money(tr), transform_money(te)
-    pre = make_preprocessor().fit(tr_l)
-    Xtr, Xte = pre.transform(tr_l), pre.transform(te_l)
+def run_experiment(profile, n, seed, top_share=0.03):
+    _, _, te, tr_l, te_l, Xtr, Xte = prepare(profile, n, seed)
     y = te.label.values
-
-    rows, normed = [], []
-    for name, fn in METHODS.items():
-        s_tr, s_te = fn(Xtr, Xte, seed)
-        rows.append(dict(method=name, **evaluate(y, s_te, top_share)))
-        normed.append(minmax(s_tr, s_te))
-    ens = np.mean(normed, axis=0)
-    rows.append(dict(method="Ансамбль (среднее)", **evaluate(y, ens, top_share)))
-    z_tr, z_te = score_zscore(tr_l, te_l)
-    rows.append(dict(method="Z-скоринг (бенчмарк)", **evaluate(y, z_te, top_share)))
-
-    # Recall ансамбля по типам аномалий
-    thr = np.quantile(ens, 1 - top_share)
-    by_type = (te.assign(flag=ens >= thr)[te.label == 1]
-                 .groupby("anomaly_type").flag.mean().to_dict())
-    return pd.DataFrame(rows), by_type
+    scores = all_scores(tr_l, te_l, Xtr, Xte, seed)
+    rows = [dict(method=m, group=METHOD_GROUP[m], **evaluate(y, s, top_share))
+            for m, s in scores.items()]
+    return pd.DataFrame(rows)
 
 
 EXPERIMENTS = [("1. Декларации по НДС", "vat", 7850),
@@ -274,22 +302,31 @@ EXPERIMENTS = [("1. Декларации по НДС", "vat", 7850),
                ("3. Смешанный набор", "mixed", 4290)]
 SEEDS = [0, 1, 2, 3, 4]
 
+
+def run_all():
+    """Все эксперименты; печатает таблицы и возвращает сырые результаты."""
+    all_results = []
+    for title, profile, n in EXPERIMENTS:
+        runs = pd.concat([run_experiment(profile, n, s).assign(seed=s) for s in SEEDS])
+        agg = (runs.drop(columns="seed")
+                   .groupby(["method", "group"], sort=False).agg(["mean", "std"])
+                   .sort_values(("F1", "mean"), ascending=False))
+        print(f"\n=== Эксперимент {title} (n={n}, {len(SEEDS)} запусков) ===")
+        print(agg.round(3).to_string())
+        all_results.append(runs.assign(experiment=title))
+    raw = pd.concat(all_results)
+    raw.to_csv("results_raw.csv", index=False)
+    print("\nСырые результаты сохранены в results_raw.csv")
+    return raw
+
+
 # ---------------------------------------------------------------------------
-# 6. Дополнительный анализ: полнота каждого метода по типам аномалий
+# 5. Дополнительный анализ
 # ---------------------------------------------------------------------------
-def recall_by_type(profile, n, seed, numeric_only=False, anomaly_share=0.021, top_share=0.03):
-    """Recall каждого метода отдельно по типам аномалий + ROC-AUC.
+def recall_by_type(profile, n, seed, numeric_only=False, top_share=0.03):
+    """Recall каждого ML-метода отдельно по типам аномалий + ROC-AUC.
     numeric_only=True — без категориальных признаков (проверка влияния one-hot)."""
-    rng = np.random.default_rng(seed)
-    df = inject_anomalies(generate(n, profile, rng), anomaly_share, rng)
-    tr, te = train_test_split(df, test_size=0.3, stratify=df.label, random_state=seed)
-    tr_l, te_l = transform_money(tr), transform_money(te)
-    if numeric_only:
-        sc = StandardScaler().fit(tr_l[NUM_FEATURES])
-        Xtr, Xte = sc.transform(tr_l[NUM_FEATURES]), sc.transform(te_l[NUM_FEATURES])
-    else:
-        pre = make_preprocessor().fit(tr_l)
-        Xtr, Xte = pre.transform(tr_l), pre.transform(te_l)
+    _, _, te, _, _, Xtr, Xte = prepare(profile, n, seed, numeric_only=numeric_only)
     out = {}
     for name, fn in METHODS.items():
         _, s = fn(Xtr, Xte, seed)
@@ -301,50 +338,184 @@ def recall_by_type(profile, n, seed, numeric_only=False, anomaly_share=0.021, to
 
 
 def additional_analysis():
+    """Возвращает таблицу Recall по типам (все признаки) для рисунка 3."""
+    from scipy.stats import spearmanr
+    result = None
     for numeric_only in (False, True):
         tables = [recall_by_type(p, n, s, numeric_only)
                   for _, p, n in EXPERIMENTS for s in SEEDS]
         avg = sum(tables) / len(tables)
-        title = ("без категориальных признаков" if numeric_only
-                 else "все признаки")
+        title = "без категориальных признаков" if numeric_only else "все признаки"
         print(f"\n=== Recall по типам аномалий и ROC-AUC, среднее по 3 экспериментам "
               f"и {len(SEEDS)} запускам ({title}) ===")
         print(avg.round(3).to_string())
+        if not numeric_only:
+            result = avg
+
+    # Поможет ли Isolation Forest убрать признаки масштаба и оставить только отношения?
+    ratio = ["payroll_per_employee", "deduction_share", "cost_ratio",
+             "revenue_per_employee", "revenue_growth"]
+    print("\n=== Isolation Forest только на признаках-отношениях: ROC-AUC, среднее по запускам ===")
+    for title, profile, n in EXPERIMENTS:
+        aucs = []
+        for s in SEEDS:
+            _, _, te, tr_l, te_l, _, _ = prepare(profile, n, s)
+            sc = StandardScaler().fit(tr_l[ratio])
+            _, sc_te = score_iforest(sc.transform(tr_l[ratio]), sc.transform(te_l[ratio]), s)
+            aucs.append(roc_auc_score(te.label, sc_te))
+        print(f"{title}: {np.mean(aucs):.3f}")
+
+    # Выходят ли аномалии за пределы разброса отдельного признака?
+    # Доля аномалий вне интервала 0,5–99,5 перцентиля нормальных деклараций (seed = 0).
+    print("\n=== Доля аномалий вне 99 % интервала нормальных значений признака (seed = 0) ===")
+    for title, profile, n in EXPERIMENTS:
+        df = prepare(profile, n, 0)[0]
+        norm = df[df.label == 0]
+        parts = []
+        for t, col in [("занижение_ФОТ", "payroll_per_employee"),
+                       ("вычеты_НДС", "deduction_share")]:
+            a = df[df.anomaly_type == t]
+            lo, hi = norm[col].quantile([0.005, 0.995])
+            parts.append(f"{t} по {col}: {((a[col] < lo) | (a[col] > hi)).mean():.2f}")
+        print(f"{title}: " + "; ".join(parts))
 
     # Что изолирует Isolation Forest в первую очередь? Сравниваем его оценку
     # с «экстремальностью» масштаба предприятия |z| по log-выручке (seed = 0).
-    from scipy.stats import spearmanr
     print("\n=== Isolation Forest и масштаб предприятия (seed = 0) ===")
     for title, profile, n in EXPERIMENTS:
-        rng = np.random.default_rng(0)
-        df = inject_anomalies(generate(n, profile, rng), 0.021, rng)
-        tr, te = train_test_split(df, test_size=0.3, stratify=df.label, random_state=0)
-        tr_l, te_l = transform_money(tr), transform_money(te)
-        pre = make_preprocessor().fit(tr_l)
-        _, s = score_iforest(pre.transform(tr_l), pre.transform(te_l), 0)
+        _, _, te, tr_l, te_l, Xtr, Xte = prepare(profile, n, 0)
+        _, s = score_iforest(Xtr, Xte, 0)
         z = np.abs((te_l.revenue - tr_l.revenue.mean()) / tr_l.revenue.std())
         top = s >= np.quantile(s, 0.97)
         print(f"{title}: Спирмен(оценка IF, |z|) = {spearmanr(s, z)[0]:.2f}; "
               f"средний |z| среди отмеченных = {z[top].mean():.2f} (по всем {z.mean():.2f}); "
               f"доля нормальных среди отмеченных = {1 - te.label[top].mean():.2f}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 6. Рисунки (сохраняются в папку figures/)
+# ---------------------------------------------------------------------------
+def _style():
+    import matplotlib
+    matplotlib.use("Agg") if __name__ == "__main__" else None
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({
+        "font.size": 9, "axes.titlesize": 10, "axes.spines.top": False,
+        "axes.spines.right": False, "axes.edgecolor": "#52514e",
+        "axes.labelcolor": "#0b0b0b", "xtick.color": "#52514e", "ytick.color": "#52514e",
+        "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6,
+        "legend.frameon": False, "savefig.dpi": 200, "savefig.bbox": "tight",
+    })
+    return plt
+
+
+TYPE_LABEL = {"точечная": "точечное искажение", "вычеты_НДС": "завышение вычетов НДС",
+              "занижение_ФОТ": "занижение ФОТ"}
+
+
+def _scatter_by_type(ax, df, x, y):
+    norm = df[df.label == 0]
+    ax.scatter(norm[x], norm[y], s=4, c=NORMAL_COLOR, alpha=0.5, lw=0, label="нормальные")
+    for t, c in TYPE_COLOR.items():
+        a = df[df.anomaly_type == t]
+        if len(a):
+            ax.scatter(a[x], a[y], s=22, c=c, edgecolor="white", lw=0.8,
+                       label=TYPE_LABEL[t], zorder=3)
+
+
+def fig1_data(path="figures/fig1_data.png"):
+    """Нормальные и аномальные декларации в двух проекциях (набор 1, seed = 0)."""
+    plt = _style()
+    df = prepare("vat", 7850, 0)[0]
+    fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.3))
+    _scatter_by_type(axes[0], df, "headcount", "payroll_per_employee")
+    axes[0].set(xscale="log", yscale="log", xlabel="Численность, чел.",
+                ylabel="ФОТ на одного работника, сом",
+                title="а) Численность и ФОТ на работника")
+    _scatter_by_type(axes[1], df, "revenue", "deduction_share")
+    axes[1].set(xscale="log", xlabel="Выручка, сом", ylabel="Доля вычетов по НДС",
+                title="б) Выручка и доля вычетов")
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.08))
+    fig.tight_layout()
+    fig.savefig(path); plt.close(fig)
+
+
+def fig2_curves(path="figures/fig2_curves.png"):
+    """ROC- и PR-кривые всех методов (набор 1, seed = 0)."""
+    from sklearn.metrics import roc_curve, precision_recall_curve
+    plt = _style()
+    _, _, te, tr_l, te_l, Xtr, Xte = prepare("vat", 7850, 0)
+    y = te.label.values
+    scores = all_scores(tr_l, te_l, Xtr, Xte, 0)
+    fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.4))
+    for m in METHOD_COLOR:
+        fpr, tpr, _ = roc_curve(y, scores[m])
+        p, r, _ = precision_recall_curve(y, scores[m])
+        axes[0].plot(fpr, tpr, c=METHOD_COLOR[m], lw=1.6, label=m)
+        axes[1].plot(r, p, c=METHOD_COLOR[m], lw=1.6)
+    axes[0].plot([0, 1], [0, 1], c="#52514e", lw=0.8, ls="--")
+    axes[0].set(xlabel="Доля ложных срабатываний", ylabel="Полнота (Recall)",
+                title="а) ROC-кривые")
+    axes[1].axhline(y.mean(), c="#52514e", lw=0.8, ls="--")
+    axes[1].set(xlabel="Полнота (Recall)", ylabel="Точность (Precision)",
+                title="б) Кривые «точность — полнота»", ylim=(0, 1))
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=3,
+               bbox_to_anchor=(0.5, -0.12))
+    fig.tight_layout()
+    fig.savefig(path); plt.close(fig)
+
+
+def fig3_recall_by_type(table, path="figures/fig3_recall_by_type.png"):
+    """Полнота каждого ML-метода по типам аномалий (среднее по экспериментам)."""
+    plt = _style()
+    types = ["занижение_ФОТ", "вычеты_НДС", "точечная"]
+    methods = ["LOF", "Автокодер", "One-Class SVM", "Isolation Forest"]
+    fig, ax = plt.subplots(figsize=(7.5, 3.2))
+    w = 0.19
+    for j, m in enumerate(methods):
+        xs = np.arange(len(types)) + (j - 1.5) * (w + 0.02)
+        vals = [table.loc[t, m] for t in types]
+        ax.bar(xs, vals, width=w, color=METHOD_COLOR[m], label=m)
+        for x_, v in zip(xs, vals):
+            ax.text(x_, v + 0.01, f"{v:.2f}".replace(".", ","), ha="center",
+                    va="bottom", fontsize=7, color="#52514e")
+    ax.set_xticks(range(len(types)), [TYPE_LABEL[t] for t in types])
+    ax.set(ylabel="Полнота (Recall)", ylim=(0, 0.65))
+    ax.grid(axis="x", visible=False)
+    ax.legend(ncol=4, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path); plt.close(fig)
+
+
+def fig4_iforest_size(path="figures/fig4_iforest_size.png"):
+    """Оценка Isolation Forest против отклонения масштаба предприятия (набор 1, seed = 0)."""
+    plt = _style()
+    _, _, te, tr_l, te_l, Xtr, Xte = prepare("vat", 7850, 0)
+    _, s = score_iforest(Xtr, Xte, 0)
+    d = te.assign(score=s, z=np.abs((te_l.revenue - tr_l.revenue.mean()) / tr_l.revenue.std()))
+    fig, ax = plt.subplots(figsize=(6.0, 3.6))
+    _scatter_by_type(ax, d, "z", "score")
+    ax.axhline(np.quantile(s, 0.97), c="#52514e", lw=0.8, ls="--")
+    ax.text(d.z.max(), np.quantile(s, 0.97), "порог: верхние 3 %", ha="right",
+            va="bottom", fontsize=8, color="#52514e")
+    ax.set(xlabel="|z| логарифма выручки (удалённость масштаба от среднего)",
+           ylabel="Оценка аномальности Isolation Forest")
+    ax.legend(loc="upper left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path); plt.close(fig)
+
+
+def make_figures(recall_table):
+    import os
+    os.makedirs("figures", exist_ok=True)
+    fig1_data(); fig2_curves(); fig3_recall_by_type(recall_table); fig4_iforest_size()
+    print("\nРисунки сохранены в папку figures/")
 
 
 if __name__ == "__main__":
-    pd.set_option("display.width", 140)
-    all_results = []
-    for title, profile, n in EXPERIMENTS:
-        runs, types = [], []
-        for seed in SEEDS:
-            res, bt = run_experiment(profile, n, seed)
-            runs.append(res.assign(seed=seed)); types.append(bt)
-        runs = pd.concat(runs)
-        agg = runs.groupby("method", sort=False).agg(["mean", "std"]).drop(columns="seed")
-        agg = agg.sort_values(("F1", "mean"), ascending=False)
-        print(f"\n=== Эксперимент {title} (n={n}, {len(SEEDS)} запусков) ===")
-        print(agg.round(3).to_string())
-        print("Recall ансамбля по типам аномалий:",
-              pd.DataFrame(types).mean().round(3).to_dict())
-        all_results.append(runs.assign(experiment=title))
-    pd.concat(all_results).to_csv("results_raw.csv", index=False)
-    print("\nСырые результаты сохранены в results_raw.csv")
-    additional_analysis()
+    pd.set_option("display.width", 160)
+    run_all()
+    table = additional_analysis()
+    make_figures(table)
